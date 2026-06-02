@@ -24,6 +24,7 @@ from app.services.publish_execution_service import PublishExecutorService, Publi
 from common.models.user import User, UserRole
 from common.schemas.common import ApiResponse
 from common.utils.local_image_upload import ImageUploadError, save_uploaded_image
+from common.utils.time_utils import get_beijing_now_naive
 
 def _is_admin(user: User) -> bool:
     """判断用户是否为管理员"""
@@ -106,6 +107,9 @@ async def create_material(
 async def list_materials(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, description="每页条数"),
+    title: str = Query(None, description="标题模糊搜索"),
+    category: str = Query(None, description="分类筛选"),
+    condition: str = Query(None, description="成色筛选"),
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> Dict[str, Any]:
@@ -113,7 +117,10 @@ async def list_materials(
     svc = ProductMaterialService(session)
     # 管理员查看全部，普通用户只看自己的
     query_user_id = None if _is_admin(current_user) else current_user.id
-    data = await svc.list_materials(query_user_id, page=page, page_size=page_size)
+    data = await svc.list_materials(
+        query_user_id, page=page, page_size=page_size,
+        title=title, category=category, condition=condition,
+    )
     # 管理员场景：批量补充用户名
     if _is_admin(current_user) and data.get("list"):
         from sqlalchemy import select
@@ -124,6 +131,24 @@ async def list_materials(
         for m in data["list"]:
             m["username"] = name_map.get(m["user_id"], "未知用户")
     return ApiResponse(success=True, message="查询成功", data=data)
+
+
+class BatchDeleteRequest(BaseModel):
+    """批量删除素材请求"""
+    ids: List[int] = Field(..., min_length=1, description="素材ID列表")
+
+
+@router.post("/materials/batch-delete", response_model=ApiResponse)
+async def batch_delete_materials(
+    req: BatchDeleteRequest,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Dict[str, Any]:
+    """批量删除素材（管理员可删除任意素材）"""
+    svc = ProductMaterialService(session)
+    query_user_id = None if _is_admin(current_user) else current_user.id
+    count = await svc.batch_delete(req.ids, query_user_id)
+    return ApiResponse(success=True, message=f"成功删除 {count} 条素材", data={"deleted_count": count})
 
 
 @router.get("/materials/{material_id}", response_model=ApiResponse)
@@ -421,7 +446,7 @@ async def clear_publish_logs(
     session: AsyncSession = Depends(get_db_session),
 ) -> Dict[str, Any]:
     """清空发布日志（只清空30天前的数据）"""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     from loguru import logger
     from sqlalchemy import delete
@@ -429,7 +454,7 @@ async def clear_publish_logs(
     from common.models.publish_log import PublishLog
 
     try:
-        thirty_days_ago = datetime.now() - timedelta(days=30)
+        thirty_days_ago = get_beijing_now_naive() - timedelta(days=30)
         stmt = delete(PublishLog).where(
             PublishLog.user_id == current_user.id,
             PublishLog.created_at < thirty_days_ago,

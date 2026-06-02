@@ -28,6 +28,7 @@ from common.models.default_reply import DefaultReply
 from common.models.confirm_receipt_message import ConfirmReceiptMessage
 from common.models.user_setting import UserSetting
 from common.models.system_setting import SystemSetting
+from common.utils.time_utils import get_beijing_now, get_beijing_now_naive
 
 
 # 线程本地存储，用于缓存每个线程的数据库引擎和会话工厂
@@ -42,8 +43,8 @@ def _get_thread_local_session_maker():
             settings.async_database_url,
             echo=False,
             pool_pre_ping=False,  # 关闭 pre_ping（asyncmy 新版本不兼容）
-            pool_size=3,
-            max_overflow=5,
+            pool_size=1,   # 兼容层线程为一次性，单协程只需 1 条连接（原 3，避免连接累积）
+            max_overflow=2,  # 仅留少量溢出余量（原 5），降低单引擎最大连接数 8 -> 3
             pool_timeout=30,  # 获取连接超时时间
             pool_recycle=600,  # 连接回收时间（10分钟），防止MySQL断开
         )
@@ -97,10 +98,23 @@ class DBManagerCompat:
                         # 执行异步函数
                         result[0] = new_loop.run_until_complete(async_func(session_maker))
                     finally:
+                        # 主动释放本线程引擎的连接池：本兼容层使用一次性线程，
+                        # threading.local 缓存对新线程必然 miss（每次新建引擎），
+                        # 若不主动 dispose，连接需等 GC 才回收，高并发下易累积、打满 MySQL。
+                        try:
+                            engine = getattr(_thread_local, 'engine', None)
+                            if engine is not None:
+                                new_loop.run_until_complete(engine.dispose())
+                                # 清掉缓存，避免后续误用已释放的引擎
+                                _thread_local.engine = None
+                                if hasattr(_thread_local, 'session_maker'):
+                                    del _thread_local.session_maker
+                        except Exception:
+                            pass
                         # 清理事件循环
                         try:
                             new_loop.run_until_complete(new_loop.shutdown_asyncgens())
-                        except:
+                        except Exception:
                             pass
                         new_loop.close()
                 except Exception as e:
@@ -235,6 +249,16 @@ class DBManagerCompat:
                 result = await session.execute(stmt)
                 confirm_before_send = result.scalar_one_or_none()
                 return bool(confirm_before_send) if confirm_before_send is not None else False
+        return self._run_async(_query)
+
+    def get_send_before_confirm(self, cookie_id: str) -> bool:
+        """获取卡券发送成功再确认发货开关设置"""
+        async def _query(session_maker):
+            async with session_maker() as session:
+                stmt = select(XYAccount.send_before_confirm).where(XYAccount.account_id == cookie_id)
+                result = await session.execute(stmt)
+                send_before_confirm = result.scalar_one_or_none()
+                return bool(send_before_confirm) if send_before_confirm is not None else False
         return self._run_async(_query)
 
     def get_cookie_status(self, cookie_id: str) -> bool:
@@ -480,6 +504,38 @@ class DBManagerCompat:
                 account_result = await session.execute(account_stmt)
                 account_row = account_result.first()
 
+                # 判断当天是否已存在相同状态和失败原因的记录，存在则只更新不重复插入
+                today_start = get_beijing_now().replace(hour=0, minute=0, second=0, microsecond=0)
+                today_end = get_beijing_now().replace(hour=23, minute=59, second=59, microsecond=999999)
+
+                # 构建去重查询条件
+                dedup_filters = [
+                    XYAccountLoginLog.account_identifier == cookie_id,
+                    XYAccountLoginLog.login_status == login_status,
+                    XYAccountLoginLog.created_at >= today_start,
+                    XYAccountLoginLog.created_at <= today_end,
+                ]
+                if failure_reason is not None:
+                    dedup_filters.append(XYAccountLoginLog.failure_reason == failure_reason)
+                else:
+                    dedup_filters.append(XYAccountLoginLog.failure_reason.is_(None))
+
+                existing_stmt = select(XYAccountLoginLog).where(*dedup_filters)
+                existing_result = await session.execute(existing_stmt)
+                existing_log = existing_result.scalars().first()
+
+                if existing_log:
+                    # 当天已存在相同状态和失败原因的记录，只更新相关字段
+                    existing_log.username = username
+                    existing_log.trigger_reason = trigger_reason
+                    existing_log.error_message = error_message
+                    existing_log.updated_cookie_names = updated_cookie_names
+                    existing_log.duration_ms = duration_ms
+                    existing_log.created_at = get_beijing_now()
+                    await session.commit()
+                    return existing_log.id
+
+                # 当天不存在相同记录，新增一条
                 log = XYAccountLoginLog(
                     owner_id=account_row.owner_id if account_row else None,
                     account_pk=account_row.id if account_row else None,
@@ -752,7 +808,7 @@ class DBManagerCompat:
                 if current_urls:
                     try:
                         urls_list = json.loads(current_urls)
-                    except:
+                    except Exception:
                         urls_list = []
                 else:
                     urls_list = []
@@ -1051,49 +1107,6 @@ class DBManagerCompat:
                 return False
         return self._run_async(_delete)
     
-    def update_default_reply_image_url(self, cookie_id: str, item_id: str, new_image_url: str) -> bool:
-        """更新默认回复的图片URL（上传CDN后更新）
-        
-        Args:
-            cookie_id: 账号标识
-            item_id: 商品ID，为None表示账号级别默认回复
-            new_image_url: 新的CDN图片URL
-        """
-        async def _update(session_maker):
-            try:
-                async with session_maker() as session:
-                    if item_id:
-                        # 商品级别的默认回复
-                        stmt = select(DefaultReply).where(
-                            and_(
-                                DefaultReply.account_id == cookie_id,
-                                DefaultReply.item_id == item_id
-                            )
-                        )
-                    else:
-                        # 账号级别的默认回复
-                        stmt = select(DefaultReply).where(
-                            and_(
-                                DefaultReply.account_id == cookie_id,
-                                DefaultReply.item_id.is_(None)
-                            )
-                        )
-                    result = await session.execute(stmt)
-                    default_reply = result.scalar_one_or_none()
-                    
-                    if default_reply:
-                        default_reply.reply_image = new_image_url
-                        await session.commit()
-                        logger.info(f"更新默认回复图片URL成功: cookie_id={cookie_id}, item_id={item_id}")
-                        return True
-                    else:
-                        logger.warning(f"未找到默认回复记录: cookie_id={cookie_id}, item_id={item_id}")
-                        return False
-            except Exception as e:
-                logger.error(f"更新默认回复图片URL失败: {e}")
-                return False
-        return self._run_async(_update)
-    
     def get_item_replay(self, item_id: str) -> Optional[Dict[str, Any]]:
         """获取商品回复信息（用于变量替换）"""
         # 返回空字典，变量替换时会使用默认值
@@ -1210,8 +1223,8 @@ class DBManagerCompat:
             }
             try:
                 async with session_maker() as session:
-                    from datetime import datetime, timedelta
-                    cutoff_date = datetime.now() - timedelta(days=days)
+                    from datetime import timedelta
+                    cutoff_date = get_beijing_now_naive() - timedelta(days=days)
                     
                     # 清理风控日志
                     try:
@@ -1491,7 +1504,6 @@ class DBManagerCompat:
                             continue  # 已存在，跳过
                         
                         # 创建新商品
-                        from datetime import datetime
                         new_item = XYCatalogItem(
                             owner_id=account_row.owner_id,
                             account_pk=account_row.id,
@@ -1503,7 +1515,7 @@ class DBManagerCompat:
                                 'detail': item_data.get('item_detail', ''),
                                 'description': item_data.get('item_description', ''),
                             },
-                            created_at=datetime.now()
+                            created_at=get_beijing_now_naive()
                         )
                         session.add(new_item)
                         saved_count += 1
@@ -1705,7 +1717,6 @@ class DBManagerCompat:
                         return False
                     
                     # 插入新订单
-                    from datetime import datetime
                     new_order = XYOrder(
                         order_no=order_id,
                         owner_id=owner_id,
@@ -1714,7 +1725,7 @@ class DBManagerCompat:
                         chat_id=chat_id or '',
                         account_id=cookie_id,
                         status='processing',
-                        created_at=datetime.now()
+                        created_at=get_beijing_now_naive()
                     )
                     session.add(new_order)
                     await session.commit()
@@ -1752,12 +1763,19 @@ class DBManagerCompat:
     def consume_batch_data(self, card_id: int) -> Optional[str]:
         """消费批量数据卡券的一条数据
 
-        从卡券的data_content中取出第一行数据并删除
+        从卡券的 data_content 中取出第一行数据并删除。
 
-        注意：
-            使用 ``SELECT ... FOR UPDATE`` 行锁 + 显式事务串行化，
-            防止同一张卡券在多订单/多任务并发发货时重复消费同一行数据，
-            避免唯一卡密/兑换码被重复派发。
+        并发安全设计（CAS 乐观锁，不依赖行锁与事务隔离级别）：
+            采用「读取当前内容 → 用单条 UPDATE 原子替换」的比较并交换方式：
+            ``UPDATE xy_cards SET data_content=<去掉首行后的剩余内容>
+              WHERE id=:card_id AND data_content=<读取到的旧内容>``。
+            MySQL（InnoDB）保证对同一行的单条 UPDATE 是串行执行的，因此并发的
+            多个消费请求中只有一个能匹配到旧内容并成功（rowcount=1），其余请求
+            rowcount=0（说明内容已被其他请求改写）后自动重读重试，从根本上避免
+            同一条卡密/兑换码被重复派发给不同订单。
+
+            相比 ``SELECT ... FOR UPDATE`` 行锁，本方案不依赖连接是否处于显式
+            事务、隔离级别或 autocommit 行为，在任意运行环境下都成立。
 
         Args:
             card_id: 卡券ID
@@ -1765,37 +1783,50 @@ class DBManagerCompat:
         Returns:
             消费的数据内容或None
         """
+        # CAS 失败（被其他并发请求抢先消费）时的最大重试次数，避免极端竞争下死循环
+        max_cas_retries = 50
+
         async def _consume(session_maker):
             async with session_maker() as session:
-                # 开启显式事务，确保 FOR UPDATE 行锁在本次消费与回写期间持续持有
-                async with session.begin():
-                    # 使用行锁查询卡券，并发消费时第二个请求会等待第一个事务提交后再读取
-                    stmt = select(Card).where(Card.id == card_id).with_for_update()
+                for _ in range(max_cas_retries):
+                    # 1. 读取当前卡券内容（普通读，无需行锁）
+                    stmt = select(Card.data_content).where(Card.id == card_id)
                     result = await session.execute(stmt)
-                    card = result.scalars().first()
+                    current_content = result.scalar_one_or_none()
 
-                    if not card or not card.data_content:
+                    if current_content is None:
                         logger.warning(f"卡券 {card_id} 不存在或没有批量数据")
                         return None
 
-                    # 分割数据行
-                    lines = [line.strip() for line in card.data_content.split('\n') if line.strip()]
-
+                    # 2. 计算首行与剩余内容
+                    lines = [line.strip() for line in current_content.split('\n') if line.strip()]
                     if not lines:
                         logger.warning(f"卡券 {card_id} 批量数据已用完")
                         return None
 
-                    # 取出第一行
                     consumed_data = lines[0]
                     remaining_lines = lines[1:]
-
-                    # 更新卡券数据（退出 async with session.begin() 时自动提交事务并释放行锁）
                     new_content = '\n'.join(remaining_lines) if remaining_lines else ''
-                    stmt = update(Card).where(Card.id == card_id).values(data_content=new_content)
-                    await session.execute(stmt)
 
-                    logger.info(f"卡券 {card_id} 消费数据成功，剩余 {len(remaining_lines)} 条")
-                    return consumed_data
+                    # 3. CAS 原子替换：仅当 data_content 仍等于刚读取到的旧值时才更新
+                    #    并发下只有一个请求能命中（rowcount=1），其余 rowcount=0 重试
+                    cas_stmt = (
+                        update(Card)
+                        .where(Card.id == card_id, Card.data_content == current_content)
+                        .values(data_content=new_content)
+                    )
+                    cas_result = await session.execute(cas_stmt)
+                    await session.commit()
+
+                    if cas_result.rowcount == 1:
+                        logger.info(f"卡券 {card_id} 消费数据成功，剩余 {len(remaining_lines)} 条")
+                        return consumed_data
+
+                    # rowcount=0：内容已被其他并发请求改写，重读重试
+                    logger.warning(f"卡券 {card_id} 消费存在并发竞争，重试中...")
+
+                logger.error(f"卡券 {card_id} 消费失败：并发竞争超过最大重试次数 {max_cas_retries}")
+                return None
 
         try:
             return self._run_async(_consume)

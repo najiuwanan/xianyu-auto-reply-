@@ -21,6 +21,8 @@ from loguru import logger
 from common.utils.xianyu_utils import (
     trans_cookies, generate_device_id, generate_mid
 )
+from common.utils.time_utils import get_beijing_now_naive
+from common.utils.text_utils import safe_str
 from app.services.xianyu.connection_manager import ConnectionManager, ConnectionState
 from app.services.xianyu.token_manager import TokenManager
 
@@ -554,14 +556,8 @@ class XianyuAsync:
             logger.error(f"【{self.cookie_id}】重启实例失败: {self._safe_str(e)}")
     
     def _safe_str(self, obj):
-        """安全地将对象转换为字符串"""
-        try:
-            return str(obj)
-        except:
-            try:
-                return repr(obj)
-            except:
-                return "未知对象"
+        """安全地将对象转换为字符串（委托公共实现）"""
+        return safe_str(obj)
     
     async def init(self, ws):
         """
@@ -1074,6 +1070,16 @@ class XianyuAsync:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】获取发货成功再发卡券设置失败: {e}")
             return False
+
+    def is_send_before_confirm_enabled(self) -> bool:
+        """检查是否开启卡券发送成功再确认发货开关"""
+        try:
+            from common.db.compat import db_manager
+            return db_manager.get_send_before_confirm(self.cookie_id)
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】获取卡券发送成功再确认发货设置失败: {e}")
+            return False
+            return False
     
     def _extract_order_id(self, message: dict) -> str:
         """从消息中提取订单ID（参照旧框架utils.py的extract_order_id实现）"""
@@ -1482,8 +1488,7 @@ class XianyuAsync:
             websocket: WebSocket连接
         """
         try:
-            from datetime import datetime
-            msg_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            msg_time = get_beijing_now_naive().strftime("%Y-%m-%d %H:%M:%S")
             
             chat_id = parsed_message.get("chat_id", "")
             send_user_id = parsed_message.get("send_user_id", "")
@@ -1665,7 +1670,7 @@ class XianyuAsync:
                                         # 清理临时文件
                                         try:
                                             os.unlink(tmp_path)
-                                        except:
+                                        except Exception:
                                             pass
                                 else:
                                     logger.error(f"[{msg_time}] 【{self.cookie_id}】从backend-web获取图片失败，状态码: {response.status}")
@@ -2182,27 +2187,6 @@ class XianyuAsync:
                 "image_url": image_url,
                 "error_message": str(e),
             }
-    
-    async def fetch_item_detail_from_api(self, item_id: str) -> dict:
-        """从API获取商品详情"""
-        try:
-            # 这里可以实现具体的API调用逻辑
-            # 暂时返回空字典，实际使用时需要实现
-            logger.debug(f"【{self.cookie_id}】获取商品详情: {item_id}")
-            return {}
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】获取商品详情失败: {e}")
-            return {}
-    
-    async def save_item_detail_only(self, item_id: str, detail: str) -> bool:
-        """保存商品详情"""
-        try:
-            # 这里可以实现具体的保存逻辑
-            logger.debug(f"【{self.cookie_id}】保存商品详情: {item_id}")
-            return True
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】保存商品详情失败: {e}")
-            return False
     
     async def _cancel_background_tasks(self):
         """取消并清理所有后台任务"""

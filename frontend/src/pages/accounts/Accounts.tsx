@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Globe, Timer, ScanFace, ChevronLeft, ChevronRight, ChevronDown, ImagePlus, Filter, Repeat, MoreHorizontal, PackageCheck, Star, ShieldCheck, Flower2, Eye, EyeOff, Ban, Download, Upload } from 'lucide-react'
-import { getAccountDetailsPaginated, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountsStatusBatch, closeAccountsNoticeBatch, clearTokenCacheBatch, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, checkPasswordLoginStatus, updateAccountAutoConfirm, updateAccountPauseDuration, updateAccountMessageExpireTime, updateAccountLoginInfo, updateAccountScheduledRedelivery, updateAccountScheduledRate, updateAccountAutoPolish, updateAccountConfirmBeforeSend, updateAccountAutoRedFlower, getAIReplySettings, updateAIReplySettings, testAIConnection, fetchAIModels, AI_PROVIDER_OPTIONS, AI_PROVIDER_DEFAULT_BASE_URLS, getProxyConfig, updateProxyConfig, getFaceVerificationScreenshot, deleteFaceVerificationScreenshot, getConfirmReceiptMessage, updateConfirmReceiptMessage, uploadConfirmReceiptImage, exportAccountsExcel, importAccountsExcel, type AIProviderType, type AIModelOption, type ProxyConfig, type FaceVerificationScreenshot, type AccountFilterParams } from '@/api/accounts'
+import { Plus, RefreshCw, QrCode, Key, Edit2, Trash2, Power, PowerOff, X, Loader2, Clock, CheckCircle, MessageSquare, Bot, Globe, Timer, ScanFace, ChevronLeft, ChevronRight, ChevronDown, ImagePlus, Filter, Repeat, MoreHorizontal, PackageCheck, Star, ShieldCheck, Flower2, Eye, EyeOff, Ban, Download, Upload, Send } from 'lucide-react'
+import { getAccountDetailsPaginated, deleteAccount, updateAccountCookie, updateAccountStatus, updateAccountsStatusBatch, closeAccountsNoticeBatch, clearTokenCacheBatch, updateAccountRemark, addAccount, generateQRLogin, checkQRLoginStatus, passwordLogin, checkPasswordLoginStatus, updateAccountAutoConfirm, updateAccountPauseDuration, updateAccountMessageExpireTime, updateAccountLoginInfo, updateAccountScheduledRedelivery, updateAccountScheduledRate, updateAccountAutoPolish, updateAccountConfirmBeforeSend, updateAccountSendBeforeConfirm, updateAccountAutoRedFlower, getAIReplySettings, updateAIReplySettings, testAIConnection, fetchAIModels, AI_PROVIDER_OPTIONS, AI_PROVIDER_DEFAULT_BASE_URLS, getProxyConfig, updateProxyConfig, getFaceVerificationScreenshot, deleteFaceVerificationScreenshot, getConfirmReceiptMessage, updateConfirmReceiptMessage, uploadConfirmReceiptImage, exportAccountsExcel, importAccountsExcel, type AIProviderType, type AIModelOption, type ProxyConfig, type FaceVerificationScreenshot, type AccountFilterParams } from '@/api/accounts'
 import { getDefaultReply, updateDefaultReply, uploadDefaultReplyImage } from '@/api/keywords'
 import { getAutoRateConfig, updateAutoRateConfig } from '@/api/autoRate'
+import { checkAdminDefaultPassword } from '@/api/auth'
 import { getApiErrorMessage } from '@/utils/request'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
@@ -69,7 +70,7 @@ const getAIConfigIncompleteMessage = (missingItems: string[]): string => (
 
 export function Accounts() {
   const { addToast } = useUIStore()
-  const { isAuthenticated, token, _hasHydrated } = useAuthStore()
+  const { isAuthenticated, token, user, _hasHydrated } = useAuthStore()
   const { isExeMode } = useMenuVisibilityStore()
   const navigate = useNavigate()
   const [loading, setLoading] = useState(true)
@@ -218,7 +219,7 @@ export function Accounts() {
   const [deleteFaceConfirm, setDeleteFaceConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([])
-  const [batchAction, setBatchAction] = useState<'enable' | 'disable' | 'close-notice' | 'clear-token' | 'renew-login' | null>(null)
+  const [batchAction, setBatchAction] = useState<'enable' | 'disable' | 'close-notice' | 'clear-token' | 'renew-login' | 'batch-rate' | null>(null)
   const [exporting, setExporting] = useState(false)
   const [showImportModal, setShowImportModal] = useState(false)
   const [importFile, setImportFile] = useState<File | null>(null)
@@ -403,8 +404,38 @@ export function Accounts() {
     setEditPasswordVisible(false)
   }, [clearQrCheck, clearPwdCheck])
 
+  // ==================== 管理员默认密码检查 ====================
+  /**
+   * 检查管理员是否使用默认密码，如果是则弹窗提示并阻止添加账号
+   * 返回 true 表示通过检查（可以继续），false 表示被拦截
+   */
+  const checkAdminPassword = async (): Promise<boolean> => {
+    // 仅管理员需要检查
+    if (!user?.is_admin) {
+      return true
+    }
+    try {
+      const result = await checkAdminDefaultPassword()
+      if (result.success && result.data?.is_default) {
+        addToast({
+          type: 'warning',
+          message: '检测到您仍在使用默认密码，为保障系统安全，请先前往个人设置修改密码后再添加账号',
+        })
+        return false
+      }
+      return true
+    } catch {
+      // 接口异常时不阻止操作
+      return true
+    }
+  }
+
   // ==================== 扫码登录 ====================
   const startQRCodeLogin = async () => {
+    // 管理员默认密码检查
+    const passed = await checkAdminPassword()
+    if (!passed) return
+
     setActiveModal('qrcode')
     setQrStatus('loading')
     setQrErrorMessage('')
@@ -766,6 +797,41 @@ export function Accounts() {
     }
   }
 
+  const handleBatchRate = async () => {
+    if (selectedCount === 0) {
+      addToast({ type: 'warning', message: '请先选择账号' })
+      return
+    }
+
+    setBatchAction('batch-rate')
+    try {
+      const { batchRateOrders } = await import('@/api/autoRate')
+      const result = await batchRateOrders(selectedAccountIds)
+      if (result.success) {
+        const data = result.data
+        if (data) {
+          const details = data.details || []
+          const failedAccounts = details.filter(d => !d.success)
+          if (failedAccounts.length > 0) {
+            const failedMsg = failedAccounts.slice(0, 3).map(d => `${d.account_id}：${d.message}`).join('；')
+            addToast({ type: 'warning', message: `${result.message}。${failedMsg}` })
+          } else {
+            addToast({ type: 'success', message: result.message || '批量补评价完成' })
+          }
+        } else {
+          addToast({ type: 'success', message: result.message || '批量补评价完成' })
+        }
+      } else {
+        addToast({ type: 'error', message: result.message || '批量补评价失败' })
+      }
+      setSelectedAccountIds([])
+    } catch (error) {
+      addToast({ type: 'error', message: getApiErrorMessage(error, '批量补评价失败') })
+    } finally {
+      setBatchAction(null)
+    }
+  }
+
   const handleExport = async () => {
     setExporting(true)
     try {
@@ -1054,11 +1120,25 @@ export function Accounts() {
     try {
       await updateAccountConfirmBeforeSend(account.id, newEnabled)
       setAccounts(prev => prev.map(a =>
-        a.id === account.id ? { ...a, confirm_before_send: newEnabled } : a,
+        a.id === account.id ? { ...a, confirm_before_send: newEnabled, ...(newEnabled ? { send_before_confirm: false } : {}) } : a,
       ))
       addToast({ type: 'success', message: `发货成功再发卡券已${newEnabled ? '开启' : '关闭'}` })
     } catch {
       addToast({ type: 'error', message: '更新发货成功再发卡券开关失败' })
+    }
+  }
+
+  // ==================== 卡券发送成功再确认发货开关 ====================
+  const handleToggleSendBeforeConfirm = async (account: AccountWithKeywordCount) => {
+    const newEnabled = !account.send_before_confirm
+    try {
+      await updateAccountSendBeforeConfirm(account.id, newEnabled)
+      setAccounts(prev => prev.map(a =>
+        a.id === account.id ? { ...a, send_before_confirm: newEnabled, ...(newEnabled ? { confirm_before_send: false } : {}) } : a,
+      ))
+      addToast({ type: 'success', message: `卡券发送成功再确认发货已${newEnabled ? '开启' : '关闭'}` })
+    } catch {
+      addToast({ type: 'error', message: '更新卡券发送成功再确认发货开关失败' })
     }
   }
 
@@ -1601,7 +1681,11 @@ export function Accounts() {
 
             {!isExeMode && (
               <button
-                onClick={() => navigate('/accounts/shared-scan')}
+                onClick={async () => {
+                  const passed = await checkAdminPassword()
+                  if (!passed) return
+                  navigate('/accounts/shared-scan')
+                }}
                 className="flex items-center gap-3 p-4 rounded-md border border-emerald-200 dark:border-emerald-800 
                            bg-emerald-50 dark:bg-emerald-900/30 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors text-left"
               >
@@ -1617,7 +1701,11 @@ export function Accounts() {
 
             {/* 账号密码登录 */}
             <button
-              onClick={() => setActiveModal('password')}
+              onClick={async () => {
+                const passed = await checkAdminPassword()
+                if (!passed) return
+                setActiveModal('password')
+              }}
               className="flex items-center gap-3 p-4 rounded-md border border-slate-200 dark:border-slate-700 
                          hover:border-blue-300 dark:hover:border-blue-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-colors text-left"
             >
@@ -1632,7 +1720,11 @@ export function Accounts() {
 
             {/* 手动输入 */}
             <button
-              onClick={() => setActiveModal('manual')}
+              onClick={async () => {
+                const passed = await checkAdminPassword()
+                if (!passed) return
+                setActiveModal('manual')
+              }}
               className="flex items-center gap-3 p-4 rounded-md border border-slate-200 dark:border-slate-700 
                          hover:border-blue-300 dark:hover:border-blue-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 transition-colors text-left"
             >
@@ -1698,6 +1790,14 @@ export function Accounts() {
             >
               {batchAction === 'renew-login' ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
               账号续期
+            </button>
+            <button
+              onClick={handleBatchRate}
+              disabled={selectedCount === 0 || batchOperating}
+              className="btn-ios-secondary btn-sm text-rose-600 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {batchAction === 'batch-rate' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Star className="w-4 h-4" />}
+              订单补评价
             </button>
             <button
               onClick={handleExport}
@@ -2067,6 +2167,18 @@ export function Accounts() {
                           title={`发货成功再发卡券：${account.confirm_before_send ? '已开启（点击关闭）' : '已关闭（点击开启，开启后确认发货失败将不发送卡券）'}`}
                         >
                           <ShieldCheck className="w-3.5 h-3.5" />
+                        </button>
+                        {/* 卡券发送成功再确认发货 */}
+                        <button
+                          onClick={() => handleToggleSendBeforeConfirm(account)}
+                          className={`inline-flex items-center justify-center w-7 h-7 rounded transition-colors ${
+                            account.send_before_confirm
+                              ? 'bg-amber-100 text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-300 dark:hover:bg-amber-900/50'
+                              : 'bg-slate-100 text-slate-400 hover:bg-slate-200 dark:bg-slate-700 dark:text-slate-500 dark:hover:bg-slate-600'
+                          }`}
+                          title={`卡券发送成功再确认发货：${account.send_before_confirm ? '已开启（点击关闭）' : '已关闭（点击开启，开启后先发卡券，发送成功后再确认发货）'}`}
+                        >
+                          <Send className="w-3.5 h-3.5" />
                         </button>
                         {/* 自动求小红花 */}
                         <button

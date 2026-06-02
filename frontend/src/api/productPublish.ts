@@ -149,12 +149,16 @@ export const createMaterial = (params: MaterialCreateParams): Promise<ApiRespons
 /** 分页查询素材列表 */
 export const getMaterials = (
   page = 1,
-  pageSize = 20
+  pageSize = 20,
+  filters?: { title?: string; category?: string; condition?: string }
 ): Promise<MaterialListResponse> => {
   const params = new URLSearchParams({
     page: String(page),
     page_size: String(pageSize),
   })
+  if (filters?.title) params.append('title', filters.title)
+  if (filters?.category) params.append('category', filters.category)
+  if (filters?.condition) params.append('condition', filters.condition)
   return get(`${PREFIX}/materials?${params}`)
 }
 
@@ -171,6 +175,10 @@ export const updateMaterial = (
 /** 删除素材 */
 export const deleteMaterial = (id: number): Promise<ApiResponse> =>
   del(`${PREFIX}/materials/${id}`)
+
+/** 批量删除素材 */
+export const batchDeleteMaterials = (ids: number[]): Promise<ApiResponse> =>
+  post(`${PREFIX}/materials/batch-delete`, { ids })
 
 // ==================== 发布接口 ====================
 
@@ -189,7 +197,7 @@ export const publishSingle = (params: {
   brand?: string
   condition?: string
 }): Promise<PublishSingleResponse> =>
-  post(`${PREFIX}/publish/single`, params, { timeout: 300000 }) // 5分钟超时
+  post(`${PREFIX}/publish/single`, params, { timeout: 600000 }) // 10分钟超时
 
 /** 批量发布（异步，立即返回 batch_id） */
 export const publishBatch = (params: {

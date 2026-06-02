@@ -199,8 +199,10 @@ class AccountService:
         if conditions:
             base_stmt = base_stmt.where(and_(*conditions))
         
-        # 查询总数
-        count_stmt = select(func.count()).select_from(base_stmt.subquery())
+        # 查询总数：直接基于条件统计，避免把整表 SELECT 包进子查询
+        count_stmt = select(func.count(XYAccount.id))
+        if conditions:
+            count_stmt = count_stmt.where(and_(*conditions))
         total_result = await self.session.execute(count_stmt)
         total = total_result.scalar() or 0
         
@@ -463,8 +465,18 @@ class AccountService:
         await self.session.commit()
 
     async def update_confirm_before_send(self, account: XYAccount, confirm_before_send: bool) -> None:
-        """更新发货成功再发卡券开关"""
+        """更新发货成功再发卡券开关（与send_before_confirm互斥）"""
         account.confirm_before_send = confirm_before_send
+        if confirm_before_send:
+            account.send_before_confirm = False
+        self.session.add(account)
+        await self.session.commit()
+
+    async def update_send_before_confirm(self, account: XYAccount, send_before_confirm: bool) -> None:
+        """更新卡券发送成功再确认发货开关（与confirm_before_send互斥）"""
+        account.send_before_confirm = send_before_confirm
+        if send_before_confirm:
+            account.confirm_before_send = False
         self.session.add(account)
         await self.session.commit()
 

@@ -21,6 +21,7 @@ import { GetSourceCode } from '@/pages/auth/GetSourceCode'
 
 // 页面组件懒加载，按需加载提升首屏速度
 const Dashboard = React.lazy(() => import('@/pages/dashboard/Dashboard').then(m => ({ default: m.Dashboard })))
+const DataOverview = React.lazy(() => import('@/pages/data_analysis/DataOverview').then(m => ({ default: m.DataOverview })))
 const Accounts = React.lazy(() => import('@/pages/accounts/Accounts').then(m => ({ default: m.Accounts })))
 const Items = React.lazy(() => import('@/pages/items/Items').then(m => ({ default: m.Items })))
 const Orders = React.lazy(() => import('@/pages/orders/Orders').then(m => ({ default: m.Orders })))
@@ -41,6 +42,7 @@ const GoofishCompass = React.lazy(() => import('@/pages/compass/GoofishCompass')
 const GoofishScheduledCrawler = React.lazy(() => import('@/pages/crawler/GoofishScheduledCrawler').then(m => ({ default: m.GoofishScheduledCrawler })))
 const Cards = React.lazy(() => import('@/pages/cards/Cards').then(m => ({ default: m.Cards })))
 const PersonalSettings = React.lazy(() => import('@/pages/personalSettings/PersonalSettings').then(m => ({ default: m.PersonalSettings })))
+const Blacklist = React.lazy(() => import('@/pages/blacklist/Blacklist'))
 const SupplyManagement = React.lazy(() => import('@/pages/distribution/SupplyManagement').then(m => ({ default: m.SupplyManagement })))
 const DockedProducts = React.lazy(() => import('@/pages/distribution/DockedProducts').then(m => ({ default: m.DockedProducts })))
 const DealerManagement = React.lazy(() => import('@/pages/distribution/DealerManagement').then(m => ({ default: m.DealerManagement })))
@@ -318,6 +320,7 @@ function App() {
           >
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="dashboard" element={<Dashboard />} />
+            <Route path="data-analysis/overview" element={<DataOverview />} />
             <Route path="accounts" element={<Accounts />} />
             <Route path="accounts/shared-scan" element={<SharedScanManager />} />
             <Route path="items" element={<Items />} />
@@ -351,6 +354,7 @@ function App() {
             <Route path="product-publish/addresses" element={<PublishAddresses />} />
             <Route path="product-publish/logs" element={<PublishLogs />} />
             <Route path="personal-settings" element={<PersonalSettings />} />
+            <Route path="blacklist" element={<Blacklist />} />
             <Route path="settings" element={<Settings />} />
             {/* 共享多人扫码登录管理端 */}
             <Route path="shared-scan" element={<Navigate to="/accounts/shared-scan" replace />} />
