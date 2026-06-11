@@ -300,12 +300,13 @@ class GoofishImClient:
         ).decode("utf-8")
 
         mid = generate_mid()
+        message_uuid = generate_uuid()
         msg = {
             "lwp": "/r/MessageSend/sendByReceiverScope",
             "headers": {"mid": mid},
             "body": [
                 {
-                    "uuid": generate_uuid(),
+                    "uuid": message_uuid,
                     "cid": full_cid,
                     "conversationType": 1,
                     "content": {
@@ -322,7 +323,136 @@ class GoofishImClient:
             ],
         }
         response = await self._send_and_wait(mid, msg)
+        # IM 服务端对违规内容会返回带 reason 的 body（如 CSI_FORBID 安全拦截），
+        # 此时虽然响应携带 body 不会在 _send_and_wait 抛错，但消息实际未送达，
+        # 需在此识别为发送失败并抛出明文原因，供上层反馈给前端。
+        self._raise_if_send_rejected(response)
+        # 解析服务端返回的 messageId，供消息撤回功能使用
+        body = response.get("body", {})
+        message_id = ""
+        if isinstance(body, dict):
+            raw_message_id = body.get("messageId") or body.get("1")
+            if isinstance(raw_message_id, dict):
+                raw_message_id = raw_message_id.get("messageId") or raw_message_id.get("1")
+            if isinstance(raw_message_id, str):
+                message_id = raw_message_id
+        return {"response": response, "messageId": message_id, "uuid": message_uuid}
+
+    async def send_image_message(
+        self,
+        cid: str,
+        to_user_id: str,
+        image_url: str,
+        width: int = 800,
+        height: int = 600,
+    ) -> Dict[str, Any]:
+        """
+        发送图片消息
+
+        与 send_text_message 协议一致，仅消息体内容为 contentType=2 的图片结构。
+        图片必须是已上传到闲鱼CDN的可访问URL（通过 ImageUploader 上传得到）。
+
+        Args:
+            cid: 会话ID（不含@goofish后缀）
+            to_user_id: 对方用户ID
+            image_url: 闲鱼CDN图片URL
+            width: 图片宽度（像素），用于前端按比例渲染
+            height: 图片高度（像素）
+
+        Returns:
+            包含 response、messageId、uuid 的结果字典
+        """
+        full_cid = cid if "@goofish" in cid else f"{cid}@goofish"
+        full_to = to_user_id if "@goofish" in to_user_id else f"{to_user_id}@goofish"
+        full_self = f"{self.myid}@goofish"
+
+        # 构造图片消息 payload（pics 数组格式，与官方协议一致）
+        payload = {
+            "contentType": 2,
+            "image": {
+                "pics": [
+                    {
+                        "height": int(height),
+                        "type": 0,
+                        "url": image_url,
+                        "width": int(width),
+                    }
+                ]
+            },
+        }
+        data_b64 = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("utf-8")
+
+        mid = generate_mid()
+        message_uuid = generate_uuid()
+        msg = {
+            "lwp": "/r/MessageSend/sendByReceiverScope",
+            "headers": {"mid": mid},
+            "body": [
+                {
+                    "uuid": message_uuid,
+                    "cid": full_cid,
+                    "conversationType": 1,
+                    "content": {
+                        "contentType": 101,
+                        "custom": {"type": 1, "data": data_b64},
+                    },
+                    "redPointPolicy": 0,
+                    "extension": {"extJson": "{}"},
+                    "ctx": {"appVersion": "1.0", "platform": "web"},
+                    "mtags": {},
+                    "msgReadStatusSetting": 1,
+                },
+                {"actualReceivers": [full_to, full_self]},
+            ],
+        }
+        response = await self._send_and_wait(mid, msg)
+        # 与文本发送一致，识别安全拦截等业务错误并抛出明文原因
+        self._raise_if_send_rejected(response)
+        body = response.get("body", {})
+        message_id = ""
+        if isinstance(body, dict):
+            raw_message_id = body.get("messageId") or body.get("1")
+            if isinstance(raw_message_id, dict):
+                raw_message_id = raw_message_id.get("messageId") or raw_message_id.get("1")
+            if isinstance(raw_message_id, str):
+                message_id = raw_message_id
+        return {"response": response, "messageId": message_id, "uuid": message_uuid}
+
+    async def recall_message(self, message_id: str) -> Dict[str, Any]:
+        """通过闲鱼官方 IM 协议撤回一条消息"""
+        mid = generate_mid()
+        response = await self._send_and_wait(mid, {
+            "lwp": "/r/MessageManager/recallMessage",
+            "headers": {"mid": mid},
+            "body": [message_id],
+        })
+        if response.get("code") != 200:
+            body = response.get("body", {})
+            reason = body.get("reason") if isinstance(body, dict) else ""
+            raise RuntimeError(reason or "闲鱼未确认撤回成功")
         return response
+
+    @staticmethod
+    def _raise_if_send_rejected(response: Dict[str, Any]) -> None:
+        """检查发送响应是否被 IM 服务端拒绝（如安全拦截），是则抛出明文原因
+
+        Args:
+            response: IM 服务器返回的完整响应
+
+        Raises:
+            Exception: 当响应 body 含 reason（业务错误）时抛出，message 为服务端原因文案
+        """
+        if not isinstance(response, dict):
+            return
+        body = response.get("body", {})
+        if isinstance(body, dict) and body.get("reason"):
+            reason = body.get("reason", "")
+            more_info = body.get("moreInfo", "")
+            # moreInfo 形如 "CSI_FORBID||安全拦截"，附在原因后便于定位拦截类型
+            detail = f"{reason}（{more_info}）" if more_info else reason
+            raise Exception(detail)
 
     # ==================== Token缓存（数据库） ====================
     # 缓存键使用 chat_{myid} 前缀，与自动回复WebSocket的缓存隔离，
